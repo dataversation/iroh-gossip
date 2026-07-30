@@ -174,7 +174,7 @@
 <a href=#174 id=174 data-nosnippet>174</a>        <span class="kw">let </span>path = out_dir.as_ref().join(<span class="macro">format!</span>(<span class="string">"{label}.config.toml"</span>));
 <a href=#175 id=175 data-nosnippet>175</a>        <span class="kw">let </span>encoded = toml::to_string(<span class="kw-2">&amp;</span>scenario).std_context(<span class="string">"encode scenario"</span>)<span class="question-mark">?</span>;
 <a href=#176 id=176 data-nosnippet>176</a>        std::fs::write(<span class="kw-2">&amp;</span>path, encoded)
-<a href=#177 id=177 data-nosnippet>177</a>            .with_std_context(|<span class="kw">_</span>| <span class="macro">format!</span>(<span class="string">"write scenario {}"</span>, <span class="kw-2">&amp;</span>path.display()))<span class="question-mark">?</span>;
+<a href=#177 id=177 data-nosnippet>177</a>            .with_std_context(|<span class="kw">_</span>| <span class="macro">format!</span>(<span class="string">"write scenario {}"</span>, path.display()))<span class="question-mark">?</span>;
 <a href=#178 id=178 data-nosnippet>178</a>    }
 <a href=#179 id=179 data-nosnippet>179</a>
 <a href=#180 id=180 data-nosnippet>180</a>    <span class="kw">let </span>result = run_simulation(seeds, scenario);
