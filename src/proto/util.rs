@@ -257,9 +257,14 @@ impl<T> TimerMap<T> {
     /// Pop the first entry, if equal or before `limit`.
     pub fn pop_before(&mut self, limit: Instant) -> Option<(Instant, T)> {
         match self.heap.peek() {
-            Some(item) if item.time <= limit => self.heap.pop().map(|item| (item.time, item.item)),
+            Some(item) if item.time <= limit => self.pop(),
             _ => None,
         }
+    }
+
+    /// Pop the first entry, whatever its instant.
+    pub fn pop(&mut self) -> Option<(Instant, T)> {
+        self.heap.pop().map(|item| (item.time, item.item))
     }
 
     /// Get a reference to the earliest entry in the `TimerMap`.
@@ -312,11 +317,30 @@ impl<T> Ord for TimerMapEntry<T> {
     }
 }
 
-/// A hash map where entries expire after a time
+/// An entry in a [`TimeBoundCache`].
+#[derive(Debug)]
+struct CacheEntry<V> {
+    /// The instant at which this entry expires.
+    expires: Instant,
+    /// The size accounted for this entry against the cache's size bound.
+    size: usize,
+    /// The cached value.
+    value: V,
+}
+
+/// A hash map where entries expire after a time, and optionally once the total
+/// size of the values it holds exceeds a bound.
+///
+/// The cache cannot know what a value costs, so the size of a value is passed
+/// in by the caller at [`Self::insert_with_size`]. Values inserted with
+/// [`Self::insert`] are accounted as zero-sized and therefore never trigger an
+/// eviction.
 #[derive(Debug)]
 pub struct TimeBoundCache<K, V> {
-    map: HashMap<K, (Instant, V)>,
+    map: HashMap<K, CacheEntry<V>>,
     expiry: TimerMap<K>,
+    size: usize,
+    max_size: Option<usize>,
 }
 
 impl<K, V> Default for TimeBoundCache<K, V> {
@@ -324,15 +348,76 @@ impl<K, V> Default for TimeBoundCache<K, V> {
         Self {
             map: Default::default(),
             expiry: Default::default(),
+            size: 0,
+            max_size: None,
         }
     }
 }
 
 impl<K: Hash + Eq + Clone, V> TimeBoundCache<K, V> {
+    /// Create a cache that additionally bounds the total size of its values.
+    ///
+    /// When an insert would push the accounted size above `max_size`, entries
+    /// are evicted in expiry order — which is oldest first while all entries
+    /// share one retention period — until the total fits again. A value larger
+    /// than `max_size` on its own is not inserted, and the cache is left
+    /// untouched.
+    ///
+    /// `None` is unbounded, which is what [`Default`] gives you.
+    pub fn with_max_size(max_size: Option<usize>) -> Self {
+        Self {
+            max_size,
+            ..Default::default()
+        }
+    }
+
     /// Insert an item into the cache, marked with an expiration time.
-    pub fn insert(&mut self, key: K, value: V, expires: Instant) {
-        self.map.insert(key.clone(), (expires, value));
+    ///
+    /// The item is accounted as zero-sized against the cache's size bound, if
+    /// it has one. Returns the value previously stored under `key`, if any.
+    pub fn insert(&mut self, key: K, value: V, expires: Instant) -> Option<V> {
+        self.insert_with_size(key, value, expires, 0)
+    }
+
+    /// Insert an item into the cache, marked with an expiration time, and
+    /// account `size` for it against the cache's size bound.
+    ///
+    /// If the cache has a size bound and `size` alone exceeds it, nothing is
+    /// inserted and nothing is evicted. Otherwise the oldest entries are
+    /// evicted until the total accounted size is within the bound again.
+    ///
+    /// Returns the value previously stored under `key`, if any.
+    pub fn insert_with_size(
+        &mut self,
+        key: K,
+        value: V,
+        expires: Instant,
+        size: usize,
+    ) -> Option<V> {
+        if self.max_size.is_some_and(|max_size| size > max_size) {
+            return None;
+        }
+        let previous = self.map.insert(
+            key.clone(),
+            CacheEntry {
+                expires,
+                size,
+                value,
+            },
+        );
+        if let Some(previous) = &previous {
+            self.size -= previous.size;
+        }
+        self.size += size;
         self.expiry.insert(expires, key);
+        if let Some(max_size) = self.max_size {
+            while self.size > max_size {
+                if self.pop_oldest().is_none() {
+                    break;
+                }
+            }
+        }
+        previous.map(|entry| entry.value)
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -350,19 +435,26 @@ impl<K: Hash + Eq + Clone, V> TimeBoundCache<K, V> {
         self.map.is_empty()
     }
 
+    /// Get the total size accounted for the values in the cache.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
     /// Get an item from the cache.
     pub fn get(&self, key: &K) -> Option<&V> {
-        self.map.get(key).map(|(_expires, value)| value)
+        self.map.get(key).map(|entry| &entry.value)
     }
 
     /// Get the expiration time for an item.
     pub fn expires(&self, key: &K) -> Option<&Instant> {
-        self.map.get(key).map(|(expires, _value)| expires)
+        self.map.get(key).map(|entry| &entry.expires)
     }
 
     /// Iterate over all items in the cache.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V, &Instant)> {
-        self.map.iter().map(|(k, (expires, v))| (k, v, expires))
+        self.map
+            .iter()
+            .map(|(k, entry)| (k, &entry.value, &entry.expires))
     }
 
     /// Remove all entries with an expiry instant lower or equal to `instant`.
@@ -371,11 +463,13 @@ impl<K: Hash + Eq + Clone, V> TimeBoundCache<K, V> {
     pub fn expire_until(&mut self, instant: Instant) -> usize {
         let drain = self.expiry.drain_until(&instant);
         let mut count = 0;
+        let mut size = 0;
         for (time, key) in drain {
             match self.map.entry(key) {
-                hash_map::Entry::Occupied(entry) if entry.get().0 == time => {
+                hash_map::Entry::Occupied(entry) if entry.get().expires == time => {
                     // If the entry's time matches that of the item we are draining from the expiry list,
                     // remove the entry from the map and increase the count of items we removed.
+                    size += entry.get().size;
                     entry.remove();
                     count += 1;
                 }
@@ -389,7 +483,27 @@ impl<K: Hash + Eq + Clone, V> TimeBoundCache<K, V> {
                 }
             }
         }
+        self.size -= size;
         count
+    }
+
+    /// Remove and return the entry that expires first, if the cache is not empty.
+    ///
+    /// While all entries share a retention period this is the oldest entry.
+    fn pop_oldest(&mut self) -> Option<(K, V)> {
+        while let Some((time, key)) = self.expiry.pop() {
+            match self.map.entry(key) {
+                hash_map::Entry::Occupied(entry) if entry.get().expires == time => {
+                    let (key, entry) = entry.remove_entry();
+                    self.size -= entry.size;
+                    return Some((key, entry.value));
+                }
+                // As in `expire_until`: the entry was either re-added with a later expiry, in
+                // which case this expiry item is stale, or removed already.
+                _ => {}
+            }
+        }
+        None
     }
 }
 
@@ -528,5 +642,61 @@ mod test {
         cache.expire_until(t2);
         assert_eq!(cache.get(&4), None);
         assert_eq!(cache.get(&5), Some(&50));
+    }
+
+    #[test]
+    fn time_bound_cache_is_unbounded_in_size_by_default() {
+        let mut cache = TimeBoundCache::default();
+        let expires = Instant::now() + Duration::from_secs(1);
+
+        for i in 0..100 {
+            cache.insert_with_size(i, i, expires, 1000);
+        }
+
+        assert_eq!(cache.len(), 100);
+        assert_eq!(cache.size(), 100_000);
+    }
+
+    #[test]
+    fn time_bound_cache_size_bound() {
+        let mut cache = TimeBoundCache::with_max_size(Some(30));
+
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let t2 = t0 + Duration::from_secs(2);
+        let t3 = t0 + Duration::from_secs(3);
+        let t4 = t0 + Duration::from_secs(4);
+
+        cache.insert_with_size(1, 10, t1, 10);
+        cache.insert_with_size(2, 20, t2, 10);
+        cache.insert_with_size(3, 30, t3, 10);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.size(), 30);
+
+        // The fourth entry pushes the total over the bound, so the entry that expires
+        // first - the oldest - is evicted before its retention elapsed.
+        cache.insert_with_size(4, 40, t4, 10);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.size(), 30);
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&2), Some(&20));
+        assert_eq!(cache.get(&4), Some(&40));
+
+        // A value larger than the bound is not cached, and evicts nothing.
+        cache.insert_with_size(5, 50, t4, 31);
+        assert_eq!(cache.get(&5), None);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.size(), 30);
+
+        // Re-inserting a key replaces the size accounted for it.
+        cache.insert_with_size(4, 40, t4, 5);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.size(), 25);
+
+        // Expiring keeps the accounted size in step with the entries.
+        assert_eq!(cache.expire_until(t3), 2);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.size(), 5);
+        assert_eq!(cache.get(&4), Some(&40));
     }
 }

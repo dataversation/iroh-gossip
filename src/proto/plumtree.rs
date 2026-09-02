@@ -278,6 +278,26 @@ pub struct Config {
     /// Should be at least around several round trip times to peers.
     pub message_cache_retention: Duration,
 
+    /// Maximum total size, in bytes, of the payloads kept in the internal message cache.
+    ///
+    /// The message cache is bounded by [`Self::message_cache_retention`] alone, so the memory it
+    /// occupies is `retention` times the rate at which payloads arrive. That rate is chosen by the
+    /// sending peers and bounded only by the link, not by anything this node configures: a peer on
+    /// a fast link can make this node hold gigabytes, and it can do so on a single topic.
+    ///
+    /// Set this to bound that. Once the cached payloads exceed this many bytes, the oldest are
+    /// evicted before their retention has elapsed. Eviction costs recovery, not delivery: a peer
+    /// that sends a graft request for an evicted message is not repaired from this node, and a
+    /// payload larger than this bound is not cached at all. Messages are still delivered to the
+    /// application either way.
+    ///
+    /// The bound is per topic, because the cache is: a node subscribed to `n` topics can hold `n`
+    /// times this many bytes.
+    ///
+    /// The default is `None`, which is unbounded and is the behaviour of this crate before the
+    /// option existed.
+    pub message_cache_max_bytes: Option<usize>,
+
     /// Duration for which to keep the `MessageId`s for received messages.
     ///
     /// Should be at least as long as [`Self::message_cache_retention`], usually will be longer to
@@ -323,6 +343,12 @@ impl Default for Config {
 
             // This is a certainly-high-enough value for usual operation.
             message_cache_retention: Duration::from_secs(30),
+
+            // Unbounded, which is what this crate did before the option existed. What a sensible
+            // default would be depends on how many topics a node subscribes to and on how much
+            // memory it may spend, neither of which this layer knows.
+            message_cache_max_bytes: None,
+
             message_id_retention: Duration::from_secs(90),
             cache_evict_interval: Duration::from_secs(1),
         }
@@ -385,6 +411,7 @@ pub struct State<PI> {
 impl<PI: PeerIdentity> State<PI> {
     /// Initialize the [`State`] of a plumtree.
     pub fn new(me: PI, config: Config, max_message_size: usize) -> Self {
+        let cache = TimeBoundCache::with_max_size(config.message_cache_max_bytes);
         Self {
             me,
             eager_push_peers: Default::default(),
@@ -395,7 +422,7 @@ impl<PI: PeerIdentity> State<PI> {
             received_messages: Default::default(),
             graft_timer_scheduled: Default::default(),
             dispatch_timer_scheduled: false,
-            cache: Default::default(),
+            cache,
             init: false,
             stats: Default::default(),
             max_message_size,
@@ -475,11 +502,7 @@ impl<PI: PeerIdentity> State<PI> {
         if let DeliveryScope::Swarm(_) = scope {
             self.received_messages
                 .insert(id, (), now + self.config.message_id_retention);
-            self.cache.insert(
-                id,
-                message.clone(),
-                now + self.config.message_cache_retention,
-            );
+            self.cache_message(message.clone(), now);
             self.lazy_push(message.clone(), &me, io);
         }
 
@@ -518,11 +541,7 @@ impl<PI: PeerIdentity> State<PI> {
                 // TODO: add callback/event to application to get missing messages that were received before?
                 let message = message.next_round().expect("just checked");
 
-                self.cache.insert(
-                    message.id,
-                    message.clone(),
-                    now + self.config.message_cache_retention,
-                );
+                self.cache_message(message.clone(), now);
                 // push the message to our peers
                 self.eager_push(message.clone(), &sender, io);
                 self.lazy_push(message.clone(), &sender, io);
@@ -676,6 +695,17 @@ impl<PI: PeerIdentity> State<PI> {
         });
         self.eager_push_peers.remove(&peer);
         self.lazy_push_peers.remove(&peer);
+    }
+
+    /// Put a message into the cache of payloads we can reply to a [`Message::Graft`] with.
+    ///
+    /// The message's payload is accounted against [`Config::message_cache_max_bytes`], which may
+    /// evict older payloads, or refuse this one if it is larger than the bound on its own.
+    fn cache_message(&mut self, message: Gossip, now: Instant) {
+        let id = message.id;
+        let size = message.content.len();
+        self.cache
+            .insert_with_size(id, message, now + self.config.message_cache_retention, size);
     }
 
     fn on_evict_cache_timer(&mut self, now: Instant, io: &mut impl IO<PI>) {
@@ -906,5 +936,99 @@ mod test {
         let now = now + config.message_cache_retention;
         state.handle(InEvent::TimerExpired(Timer::EvictCache), now, &mut io);
         assert_eq!(state.cache.len(), 0);
+    }
+
+    /// Build a swarm gossip message with a payload of `len` bytes, distinct per `seq`.
+    fn gossip_of_len(seq: u8, len: usize) -> (MessageId, Bytes, Message) {
+        let content: Bytes = vec![seq; len].into();
+        let id = MessageId::from_content(&content);
+        (
+            id,
+            content.clone(),
+            Message::Gossip(Gossip {
+                content,
+                id,
+                scope: DeliveryScope::Swarm(Round(1)),
+            }),
+        )
+    }
+
+    #[test]
+    fn cache_is_not_bounded_by_size_by_default() {
+        let config: Config = Default::default();
+        assert_eq!(config.message_cache_max_bytes, None);
+
+        let mut state = State::new(1, config.clone(), 1024);
+        let mut io = VecDeque::new();
+        let now = Instant::now();
+
+        for seq in 0..100 {
+            let (_id, _content, message) = gossip_of_len(seq, 10);
+            state.handle(InEvent::RecvMessage(2, message), now, &mut io);
+        }
+
+        // Nothing is evicted before its retention elapses.
+        assert_eq!(state.cache.len(), 100);
+        assert_eq!(state.cache.size(), 1000);
+    }
+
+    #[test]
+    fn cache_is_bounded_by_size() {
+        let config = Config {
+            // Room for two of the three ten byte payloads below.
+            message_cache_max_bytes: Some(20),
+            ..Default::default()
+        };
+        let mut state = State::new(1, config.clone(), 1024);
+        let mut io = VecDeque::new();
+        let now = Instant::now();
+
+        let messages: Vec<_> = (0..3).map(|seq| gossip_of_len(seq, 10)).collect();
+        for (i, (_id, _content, message)) in messages.iter().enumerate() {
+            let now = now + Duration::from_millis(i as u64);
+            state.handle(InEvent::RecvMessage(2, message.clone()), now, &mut io);
+        }
+
+        // The bound holds, and the payload dropped to hold it is the oldest one.
+        assert_eq!(state.cache.size(), 20);
+        assert_eq!(state.cache.len(), 2);
+        assert!(!state.cache.contains_key(&messages[0].0));
+        assert!(state.cache.contains_key(&messages[1].0));
+        assert!(state.cache.contains_key(&messages[2].0));
+    }
+
+    #[test]
+    fn payload_larger_than_the_size_bound_is_delivered_but_not_cached() {
+        let config = Config {
+            message_cache_max_bytes: Some(20),
+            ..Default::default()
+        };
+        let mut state = State::new(1, config.clone(), 1024);
+        let mut io = VecDeque::new();
+        let now = Instant::now();
+
+        let (small_id, _small_content, small) = gossip_of_len(0, 10);
+        state.handle(InEvent::RecvMessage(2, small), now, &mut io);
+        io.clear();
+
+        let (large_id, large_content, large) = gossip_of_len(1, 21);
+        state.handle(InEvent::RecvMessage(2, large), now, &mut io);
+
+        // The oversized payload is not cached, and it evicts nothing.
+        assert!(!state.cache.contains_key(&large_id));
+        assert!(state.cache.contains_key(&small_id));
+        assert_eq!(state.cache.size(), 10);
+
+        // The size bound costs recovery, never delivery: the message is still emitted.
+        let expected = {
+            let mut io = VecDeque::new();
+            io.push(OutEvent::EmitEvent(Event::Received(GossipEvent {
+                content: large_content,
+                delivered_from: 2,
+                scope: DeliveryScope::Swarm(Round(1)),
+            })));
+            io
+        };
+        assert_eq!(io, expected);
     }
 }
